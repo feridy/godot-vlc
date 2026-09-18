@@ -78,7 +78,7 @@ pub(super) unsafe extern "C" fn audio_resume_callback(data: *mut c_void, _pts: i
         let (_, player) = (data as *mut (HeapProd<AudioFrame>, Gd<AudioStreamPlayer>))
             .as_mut()
             .unwrap();
-        if player.is_instance_valid(){
+        if player.is_instance_valid() {
             player.set_stream_paused(false);
         }
     }
