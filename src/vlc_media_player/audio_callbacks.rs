@@ -55,7 +55,7 @@ pub(super) unsafe extern "C" fn audio_play_callback(
             }
         }
 
-        if !player.is_playing() {
+        if !player.is_playing() && player.is_instance_valid() {
             player.call_thread_safe("play", &[]);
         }
     }
@@ -66,7 +66,10 @@ pub(super) unsafe extern "C" fn audio_pause_callback(data: *mut c_void, _pts: i6
         let (_, player) = (data as *mut (HeapProd<AudioFrame>, Gd<AudioStreamPlayer>))
             .as_mut()
             .unwrap();
-        player.set_stream_paused(true);
+        if player.is_instance_valid() {
+            player.set_stream_paused(true);
+        }
+        // player.set_stream_paused(true);
     }
 }
 
@@ -75,7 +78,9 @@ pub(super) unsafe extern "C" fn audio_resume_callback(data: *mut c_void, _pts: i
         let (_, player) = (data as *mut (HeapProd<AudioFrame>, Gd<AudioStreamPlayer>))
             .as_mut()
             .unwrap();
-        player.set_stream_paused(false);
+        if player.is_instance_valid(){
+            player.set_stream_paused(false);
+        }
     }
 }
 
