@@ -47,7 +47,6 @@ use godot::{
         AudioServer, AudioStream, AudioStreamPlayer, Control, IControl, Image, ImageTexture,
         Texture2D, TextureRect,
         control::{LayoutPreset, LayoutPresetMode},
-        native::AudioFrame,
         node::InternalMode,
         notify::ControlNotification,
         texture_rect::{ExpandMode, StretchMode as TextureRectStretchMode},
@@ -55,7 +54,7 @@ use godot::{
     obj::NewAlloc,
     prelude::*,
 };
-use ringbuf::{HeapProd, HeapRb, traits::Split};
+use ringbuf::{HeapRb, traits::Split};
 
 #[cfg(all(feature = "gpu", windows))]
 use godot::classes::RenderingServer;
@@ -137,8 +136,20 @@ struct VlcMediaPlayer {
     texture_rect: Gd<TextureRect>,
     video_tx: Box<mpsc::Sender<(bool, Gd<Image>)>>, // (is_resized, image)
     video_rx: mpsc::Receiver<(bool, Gd<Image>)>,
-    audio_prod: Box<(HeapProd<AudioFrame>, Gd<AudioStreamPlayer>)>,
+    /// What libvlc's audio output thread is given, and the only thing it may
+    /// touch: no Godot object lives in here (`audio_callbacks::AudioShared`).
+    /// Boxed because this address is what `libvlc_audio_set_callbacks` is
+    /// attached with, and it is written from that thread.
+    audio_shared: Box<audio_callbacks::AudioShared>,
     audio_player: Gd<AudioStreamPlayer>,
+    /// The pause state libvlc last asked for, as the main thread already applied
+    /// it. Kept here rather than read back from the player, because the engine
+    /// drives `stream_paused` on its own -- it pauses the stream when the tree
+    /// is paused and when the node leaves the tree
+    /// (`AudioStreamPlayerInternal::notification`) -- so comparing against the
+    /// player every frame would undo that. Only a change of what libvlc asked
+    /// for is worth acting on.
+    audio_paused: bool,
     /// libvlc-side `Arc<Backend>` ref; the libvlc-side ref is held via the
     /// opaque pointer passed to `libvlc_video_set_output_callbacks`. Both
     /// drop when the player is destroyed (libvlc's via `cleanup_cb`).
@@ -168,9 +179,12 @@ impl IControl for VlcMediaPlayer {
         let (video_tx, video_rx) = mpsc::channel();
         let video_tx = Box::new(video_tx);
         let mut audio_player = AudioStreamPlayer::new_alloc();
-        let audio_rb = HeapRb::new(AudioServer::singleton().get_mix_rate() as usize * 5);
+        // Read here, on the main thread: `audio_setup_callback` has to report the
+        // engine's mix rate to libvlc, and libvlc calls that from its own thread.
+        let mix_rate = AudioServer::singleton().get_mix_rate() as u32;
+        let audio_rb = HeapRb::new(mix_rate as usize * 5);
         let (audio_rb_prod, audio_rb_cons) = audio_rb.split();
-        let audio_prod = Box::new((audio_rb_prod, audio_player.clone()));
+        let audio_shared = Box::new(audio_callbacks::AudioShared::new(audio_rb_prod, mix_rate));
         let audio_stream = InternalAudioStream::create(audio_rb_cons);
         audio_player.set_stream(&audio_stream.upcast::<AudioStream>());
         Self {
@@ -190,8 +204,9 @@ impl IControl for VlcMediaPlayer {
             texture_rect: texture_rect.clone(),
             video_tx,
             video_rx,
-            audio_prod,
+            audio_shared,
             audio_player,
+            audio_paused: false,
             #[cfg(all(feature = "gpu", windows))]
             gpu_backend: None,
             #[cfg(all(feature = "gpu", windows))]
@@ -205,6 +220,11 @@ impl IControl for VlcMediaPlayer {
 
     fn on_notification(&mut self, what: ControlNotification) {
         if what == ControlNotification::INTERNAL_PROCESS {
+            // What libvlc's audio thread has asked for since the last frame.
+            // First, so that playback follows the pointer and not the frame; and
+            // here rather than in the callback, because that callback runs on
+            // libvlc's thread and may not touch any of this (`audio_callbacks`).
+            self.service_audio_requests();
             if let Ok(data) = self.video_rx.try_recv()
                 && data.1.is_instance_valid()
                 && !data.1.is_empty()
@@ -961,6 +981,73 @@ impl VlcMediaPlayer {
 }
 
 impl VlcMediaPlayer {
+    /// Applies what libvlc's audio output thread has asked for since the last
+    /// frame.
+    ///
+    /// The audio callbacks record their requests in
+    /// [`audio_callbacks::AudioShared`] and nothing else, because they run on
+    /// libvlc's thread while the `AudioStreamPlayer` they are about is a child
+    /// of this node, which the engine frees before `Drop` runs. This is the other
+    /// end of that handover, on the main thread, where the node is alive by
+    /// construction -- so no call here can be the
+    /// `AudioStreamPlayer::upcast_ref: access to instance ... after it has been
+    /// freed` that aborts the process.
+    fn service_audio_requests(&mut self) {
+        if self.audio_shared.wants_flush.swap(false, Ordering::AcqRel) {
+            self.stop_audio_playback();
+        }
+
+        // A state, so read rather than consumed, but applied only when it moves:
+        // this runs once a frame while libvlc reports a transition at most once,
+        // and the state it maps onto is not ours alone -- the engine pauses the
+        // stream itself when the tree is paused, so re-asserting the value every
+        // frame would keep undoing that.
+        let paused = self.audio_shared.wants_paused.load(Ordering::Acquire);
+        if self.audio_paused != paused {
+            self.audio_paused = paused;
+            self.audio_player.set_stream_paused(paused);
+        }
+
+        // `play` is the one call the engine refuses outside the scene tree
+        // ("Playback can only happen when a node is inside the scene tree",
+        // `AudioStreamPlayerInternal::play_basic`). The request is left where it
+        // is instead of being dropped, so it is served on the frame this node is
+        // back in the tree -- and the refusal is never provoked, which is what
+        // used to turn every audio callback during a teardown into one
+        // `ERROR:` line.
+        if !self.audio_player.is_inside_tree() {
+            return;
+        }
+
+        if self.audio_shared.wants_play.swap(false, Ordering::AcqRel)
+            && !self.audio_player.is_playing()
+        {
+            self.audio_player.play();
+            // Starting a playback is what gives `stream_paused` somewhere to
+            // live again -- the engine does not persist it while there are no
+            // playbacks registered (`AudioStreamPlayerInternal::set_stream_paused`)
+            // -- so the state libvlc asked for is re-applied right here.
+            // Without this, a pause that arrived while the ring buffer had run
+            // dry would be lost on the restart, and audio would come back
+            // playing.
+            self.audio_player.set_stream_paused(self.audio_paused);
+        }
+    }
+
+    /// Stops the audio and drops what libvlc had already delivered.
+    fn stop_audio_playback(&mut self) {
+        self.audio_player.stop();
+        if let Some(stream) = self.audio_player.get_stream()
+            && let Ok(mut internal_stream) = stream.try_cast::<InternalAudioStream>()
+        {
+            internal_stream
+                .bind_mut()
+                .playback
+                .bind_mut()
+                .clear_buffer();
+        }
+    }
+
     fn update_media(&self) {
         if let Some(media_ptr) = self.get_media_ptr() {
             unsafe {

@@ -177,7 +177,7 @@ impl VlcMediaPlayer {
                 Some(super::audio_callbacks::audio_resume_callback),
                 Some(super::audio_callbacks::audio_flush_callback),
                 Some(super::audio_callbacks::audio_drain_callback),
-                self.audio_prod.as_mut() as *mut _ as *mut c_void,
+                self.audio_shared.as_mut() as *mut _ as *mut c_void,
             );
             libvlc_audio_set_format_callbacks(
                 self.player_ptr,
