@@ -4,6 +4,7 @@
 .doc
 .claude
 .trae
+.workbuddy
 /thirdparty/vlc/
 /gdextension_template/bin/
 /artifacts/
